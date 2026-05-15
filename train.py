@@ -19,6 +19,7 @@ n_kv_heads = 2  # GQA
 n_layers = 8
 
 attention_mode = "gqa"
+encoding_mode = "learned"
 
 checkpoint_root = "checkpoints"
 if attention_mode == "gqa":
@@ -45,7 +46,8 @@ model = GPT(
     n_heads=n_heads,
     n_layers=n_layers,
     n_kv_heads=n_kv_heads,
-    mode=attention_mode
+    mode=attention_mode,
+    pos_encoding=encoding_mode
 )
 model = model.to(device)
 
