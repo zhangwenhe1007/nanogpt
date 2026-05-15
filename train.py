@@ -10,15 +10,24 @@ import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-checkpoint_dir = "checkpoints"
-os.makedirs(checkpoint_dir, exist_ok=True)
-
 block_size = 128
 batch_size = 16
 
 d_model = 128
 n_heads = 4
 n_layers = 4
+n_kv_heads = 2
+
+attention_mode = "gqa"
+
+checkpoint_root = "checkpoints"
+if attention_mode == "gqa":
+    run_name = f"gqa_q{n_heads}_kv{n_kv_heads}"
+else:
+    run_name = attention_mode
+
+checkpoint_dir = os.path.join(checkpoint_root, run_name)
+os.makedirs(checkpoint_dir, exist_ok=True)
 
 enc = tiktoken.get_encoding("gpt2")
 vocab_size = enc.n_vocab
@@ -35,6 +44,8 @@ model = GPT(
     d_model=d_model,
     n_heads=n_heads,
     n_layers=n_layers,
+    n_kv_heads=n_kv_heads,
+    mode=attention_mode
 )
 model = model.to(device)
 

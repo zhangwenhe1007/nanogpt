@@ -4,7 +4,7 @@ import torch.nn as nn
 from transformer import Transformer
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers):
+    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha"):
         super().__init__()
 
         self.block_size = block_size
@@ -12,10 +12,13 @@ class GPT(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.positional_embedding = nn.Embedding(block_size, d_model)
 
-        self.transformer = Transformer(d_model, n_heads, n_layers)
+        self.transformer = Transformer(d_model, n_heads, n_layers, n_kv_heads, mode)
         self.ln_f = nn.LayerNorm(d_model)
 
         self.lm_head = nn.Linear(d_model, vocab_size)
+
+        #weight tying
+        self.lm_head.weight = self.token_embedding.weight
     
     def forward(self, idx, targets=None):
         """
