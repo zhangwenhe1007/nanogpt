@@ -90,6 +90,7 @@ def main():
     parser.add_argument("--output", type=str, default="medium_train.txt")
     parser.add_argument("--num-examples", type=int, default=200_000)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--cosmopedia-config", type=str, default="web_samples_v2")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -104,7 +105,7 @@ def main():
         {
             "name": "cosmopedia",
             "weight": 0.20,
-            "iterator": load_stream("HuggingFaceTB/cosmopedia"),
+            "iterator": load_stream("HuggingFaceTB/cosmopedia", config=args.cosmopedia_config),
             "formatter": format_plain_text,
         },
         {
