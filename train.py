@@ -10,13 +10,13 @@ import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-block_size = 128
-batch_size = 16
+block_size = 512
+batch_size = 32  # try 64 if memory is fine
 
-d_model = 128
-n_heads = 4
-n_layers = 4
-n_kv_heads = 2
+d_model = 512
+n_heads = 8
+n_kv_heads = 2  # GQA
+n_layers = 8
 
 attention_mode = "gqa"
 
