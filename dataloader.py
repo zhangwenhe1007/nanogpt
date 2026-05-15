@@ -1,12 +1,13 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 from tokenizer import encode
 
 
 class TextDataset(Dataset):
-    def __init__(self, path, block_size, split="train", train_frac=0.9):
+    def __init__(self, path, block_size, split="train", train_frac=0.9, stride=None):
         self.block_size = block_size
+        self.stride = block_size if stride is None else stride
 
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -24,10 +25,11 @@ class TextDataset(Dataset):
             raise ValueError("split must be 'train' or 'val'")
 
     def __len__(self):
-        return len(self.data) - self.block_size
+        return max(0, (len(self.data) - self.block_size - 1) // self.stride + 1)
 
     def __getitem__(self, idx):
-        chunk = self.data[idx : idx + self.block_size + 1]
+        start = idx * self.stride
+        chunk = self.data[start : start + self.block_size + 1]
 
         x = chunk[:-1]
         y = chunk[1:]
