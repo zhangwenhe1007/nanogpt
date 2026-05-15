@@ -140,19 +140,26 @@ for step, (x, y) in enumerate(pbar):
 
     lr = scheduler.step(step)
 
-    if step > 0 and step % 1000 == 0:
+    if step > 0 and step % 10000 == 0:
         checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
         save_checkpoint(checkpoint_path, step)
     
-    if step > 0 and step % 500 == 0:
+    if step > 0 and step % 3000 == 0:
         model.eval()
 
-        prompt = "Question: What is 2 + 2?\nAnswer:"
-        ids = enc.encode(prompt)
-        idx = torch.tensor([ids], dtype=torch.long, device=device)
+        sample_prompts = [
+            "Once upon a time",
+            "In simple terms, machine learning is",
+            "Question: What is the capital of France?\nAnswer:",
+        ]
 
-        out = model.generate(idx, max_new_tokens=50)
-        print(enc.decode(out[0].tolist()))
+        for prompt in sample_prompts:
+            ids = enc.encode(prompt)
+            idx = torch.tensor([ids], dtype=torch.long, device=device)
+
+            out = model.generate(idx, max_new_tokens=30)
+            print("\n--- sample ---")
+            print(enc.decode(out[0].tolist()))
 
         model.train()
         val_loss = estimate_loss(model, val_loader, device)
