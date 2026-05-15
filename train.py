@@ -67,6 +67,8 @@ def estimate_loss(model, loader, device, max_batches=50):
 
 pbar = tqdm(train_loader)
 
+step = 0
+
 for step, (x, y) in enumerate(pbar):
     if step > 0 and step % 1000 == 0:
         checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
@@ -102,3 +104,6 @@ for step, (x, y) in enumerate(pbar):
     optimizer.step()
 
     pbar.set_description(f"loss {loss.item():.4f}")
+
+checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
+torch.save(model.state_dict(), checkpoint_path)
