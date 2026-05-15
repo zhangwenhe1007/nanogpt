@@ -17,6 +17,28 @@ def load_stream(dataset_name, *, config=None, split="train"):
     return iter(load_dataset(dataset_name, config, split=split, streaming=True))
 
 
+def make_source(name, weight, dataset_name, formatter, *, config=None, split="train"):
+    return {
+        "name": name,
+        "weight": weight,
+        "dataset_name": dataset_name,
+        "config": config,
+        "split": split,
+        "iterator": load_stream(dataset_name, config=config, split=split),
+        "formatter": formatter,
+        "resets": 0,
+    }
+
+
+def reset_source(source):
+    source["iterator"] = load_stream(
+        source["dataset_name"],
+        config=source["config"],
+        split=source["split"],
+    )
+    source["resets"] += 1
+
+
 def format_plain_text(ex):
     text = ex.get("text") or ex.get("content") or ""
     text = clean(text)
@@ -78,9 +100,15 @@ def format_openbookqa(ex):
     )
 
 
-def next_formatted(iterator, formatter):
+def next_formatted(source):
     while True:
-        formatted = formatter(next(iterator))
+        try:
+            ex = next(source["iterator"])
+        except StopIteration:
+            reset_source(source)
+            ex = next(source["iterator"])
+
+        formatted = source["formatter"](ex)
         if formatted:
             return formatted
 
@@ -96,70 +124,38 @@ def main():
     random.seed(args.seed)
 
     sources = [
-        {
-            "name": "fineweb_edu",
-            "weight": 0.60,
-            "iterator": load_stream("HuggingFaceFW/fineweb-edu", config="sample-10BT"),
-            "formatter": format_plain_text,
-        },
-        {
-            "name": "cosmopedia",
-            "weight": 0.20,
-            "iterator": load_stream("HuggingFaceTB/cosmopedia", config=args.cosmopedia_config),
-            "formatter": format_plain_text,
-        },
-        {
-            "name": "openwebmath",
-            "weight": 0.10,
-            "iterator": load_stream("open-web-math/open-web-math"),
-            "formatter": format_plain_text,
-        },
-        {
-            "name": "tinystories",
-            "weight": 0.05,
-            "iterator": load_stream("roneneldan/TinyStories"),
-            "formatter": format_tinystory,
-        },
-        {
-            "name": "gsm8k",
-            "weight": 0.025,
-            "iterator": load_stream("openai/gsm8k", config="main"),
-            "formatter": format_gsm8k,
-        },
-        {
-            "name": "triviaqa",
-            "weight": 0.015,
-            "iterator": load_stream("mandarjoshi/trivia_qa", config="rc.nocontext"),
-            "formatter": format_trivia,
-        },
-        {
-            "name": "openbookqa",
-            "weight": 0.01,
-            "iterator": load_stream("allenai/openbookqa", config="main"),
-            "formatter": format_openbookqa,
-        },
+        make_source("fineweb_edu", 0.60, "HuggingFaceFW/fineweb-edu", format_plain_text, config="sample-10BT"),
+        make_source("cosmopedia", 0.20, "HuggingFaceTB/cosmopedia", format_plain_text, config=args.cosmopedia_config),
+        make_source("openwebmath", 0.10, "open-web-math/open-web-math", format_plain_text),
+        make_source("tinystories", 0.05, "roneneldan/TinyStories", format_tinystory),
+        make_source("gsm8k", 0.025, "openai/gsm8k", format_gsm8k, config="main"),
+        make_source("triviaqa", 0.015, "mandarjoshi/trivia_qa", format_trivia, config="rc.nocontext"),
+        make_source("openbookqa", 0.01, "allenai/openbookqa", format_openbookqa, config="main"),
     ]
 
     names = [source["name"] for source in sources]
     weights = [source["weight"] for source in sources]
     by_name = {source["name"]: source for source in sources}
     counts = {name: 0 for name in names}
+    resets = {name: 0 for name in names}
 
     with open(args.output, "w", encoding="utf-8") as f:
         for i in range(args.num_examples):
             name = random.choices(names, weights=weights, k=1)[0]
             source = by_name[name]
-            text = next_formatted(source["iterator"], source["formatter"])
+            text = next_formatted(source)
 
             f.write(text)
             f.write("\n")
             counts[name] += 1
+            resets[name] = source["resets"]
 
             if (i + 1) % 10_000 == 0:
-                print(f"wrote {i + 1} examples: {counts}")
+                print(f"wrote {i + 1} examples: {counts}; resets: {resets}")
 
     print(f"done: wrote {args.num_examples} examples to {args.output}")
     print(counts)
+    print(f"resets: {resets}")
 
 
 if __name__ == "__main__":
