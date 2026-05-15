@@ -1,21 +1,27 @@
 import torch
 import torch.nn as nn
-
+import math
 from transformer import Transformer
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha"):
+    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", pos_encoding="sinusoidal"):
         super().__init__()
 
         self.block_size = block_size
         
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.positional_embedding = nn.Embedding(block_size, d_model)
+
+        if (pos_encoding == "sinusoidal"):
+            self.positional_embedding = SinusoidalPositionalEncoding(block_size, d_model)
+        elif (pos_encoding == "learned"):
+            self.positional_embedding = nn.Embedding(block_size, d_model)
+        else:
+            raise ValueError(f"unknown positional encoding: {pos_encoding}")
 
         self.transformer = Transformer(d_model, n_heads, n_layers, n_kv_heads, mode)
         self.ln_f = nn.LayerNorm(d_model)
 
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         #weight tying
         self.lm_head.weight = self.token_embedding.weight
@@ -67,3 +73,22 @@ class GPT(nn.Module):
 
             idx = torch.cat([idx, next_idx], dim=1)    # (B, T+1)
         return idx
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, block_size, d_model):
+        super().__init__()
+
+        pe = torch.zeros(block_size, d_model)
+
+        pos = torch.arange(0, block_size, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+
+        self.register_buffer("pe", pe)
+
+    def forward(self, T):
+        return self.pe[:T]
