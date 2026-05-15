@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+
 #Attention helpers
 def attention(q, k, v, mask=None):
     """
@@ -24,13 +25,54 @@ def combine_heads(q, k, v, mask=None):
     out = out.reshape(B, T, H * d_h)
     return out
 
+#RoPE
+def apply_rope(x):
+    # x: (B, H, T, d_head)
+    B, H, T, d_head = x.shape
+
+    assert d_head % 2 == 0
+    n_pairs = d_head//2
+    
+    x = x.view(B, H, T, n_pairs, 2)
+
+    x_even = x[..., 0]
+    x_odd = x[..., 1]
+
+    pos = torch.arange(T, device=x.device)
+    i = torch.arange(n_pairs, device=x.device)
+
+    theta = 10000 ** (-2 * i / d_head)
+    angles = pos[:, None] * theta[None, :]
+
+    cos = torch.cos(angles)[None, None, :, :]
+    sin = torch.sin(angles)[None, None, :, :]
+
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
+
+    x_rot = torch.stack([x_rot_even, x_rot_odd], dim=-1)
+
+    return x_rot.view(B, H, T, d_head)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        x_norm = x / rms
+        return self.scale * x_norm
+
 
 class Transformer(nn.Module):
-    def __init__(self, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha"):
+    def __init__(self, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", use_rope=True):
         super().__init__()
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, n_kv_heads, mode) for _ in range(n_layers)
+            TransformerBlock(d_model, n_heads, use_rope, n_kv_heads, mode) for _ in range(n_layers)
         ])
 
     def forward(self, x, mask=None):
@@ -40,20 +82,22 @@ class Transformer(nn.Module):
     
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, n_kv_heads=None, mode="mha"):
+    def __init__(self, d_model, n_heads, use_rope, n_kv_heads=None, mode="mha"):
         super().__init__()
         #layernorm, mha, residual add, layernorm, mlp, residual add. x6
-        self.ln1 = nn.LayerNorm(d_model)
+        #self.ln1 = nn.LayerNorm(d_model)
+        self.ln1 = RMSNorm(d_model)
 
         if (mode == "mha"):
-            self.attn = MultiHeadAttention(d_model, n_heads)
+            self.attn = MultiHeadAttention(d_model, n_heads, use_rope)
         elif (mode == "gqa" and n_kv_heads is not None):
-            self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+            self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, use_rope)
         else:
             raise ValueError(f"unknown attention mode: {mode}")
 
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = MLP(d_model)
+        #self.ln2 = nn.LayerNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model)
         
     
     def forward(self, x, mask=None):
@@ -61,7 +105,22 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 
-class MLP(nn.Module):
+class SwiGLU(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+
+        hidden_dim = int((8/3) * d_model)
+        hidden_dim = 64 * ((hidden_dim + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(d_model, hidden_dim)
+        self.up_proj = nn.Linear(d_model, hidden_dim)
+        self.silu = nn.SiLU()
+        self.down_proj = nn.Linear(hidden_dim, d_model)
+    
+    def forward(self, x):
+        return self.down_proj(self.silu(self.gate_proj(x)) * self.up_proj(x))
+
+class GeLU_MLP(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.layer1 = nn.Linear(d_model, 4 * d_model)
@@ -73,7 +132,7 @@ class MLP(nn.Module):
     
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, n_q_heads, n_kv_heads):
+    def __init__(self, d_model, n_q_heads, n_kv_heads, use_rope):
         super().__init__()
 
         assert d_model % n_q_heads == 0
@@ -82,6 +141,7 @@ class GroupedQueryAttention(nn.Module):
         self.group_size = n_q_heads // n_kv_heads
         self.n_q_heads = n_q_heads
         self.n_kv_heads = n_kv_heads
+        self.use_rope = use_rope
 
         self.q_proj = nn.Linear(d_model, n_q_heads * self.d_head)
         self.k_proj = nn.Linear(d_model, n_kv_heads * self.d_head)
@@ -92,12 +152,15 @@ class GroupedQueryAttention(nn.Module):
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
-
         B, T, _ = x.shape
 
         q = q.view(B, T, self.n_q_heads, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+
+        if self.use_rope:
+            q = apply_rope(q)
+            k = apply_rope(k)
 
         k = k.repeat_interleave(self.group_size, dim=1)
         v = v.repeat_interleave(self.group_size, dim=1)
@@ -107,9 +170,10 @@ class GroupedQueryAttention(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, use_rope):
         super().__init__()
         self.n_heads = n_heads
+        self.use_rope = use_rope
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -130,6 +194,10 @@ class MultiHeadAttention(nn.Module):
         q = q.view(B, T, H, d_head).transpose(1, 2)
         k = k.view(B, T, H, d_head).transpose(1, 2)
         v = v.view(B, T, H, d_head).transpose(1, 2)
+
+        if self.use_rope:
+            q = apply_rope(q)
+            k = apply_rope(k)
 
         out = combine_heads(q, k, v, mask)
         return self.out_proj(out)

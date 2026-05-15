@@ -1,25 +1,32 @@
 import torch
 import torch.nn as nn
 import math
-from transformer import Transformer
+from transformer import Transformer, RMSNorm
+
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", pos_encoding="sinusoidal"):
+    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", pos_encoding="rope"):
         super().__init__()
 
         self.block_size = block_size
         
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
+        use_rope = False
+
         if (pos_encoding == "sinusoidal"):
             self.positional_embedding = SinusoidalPositionalEncoding(block_size, d_model)
         elif (pos_encoding == "learned"):
             self.positional_embedding = nn.Embedding(block_size, d_model)
+        elif (pos_encoding == "rope"):
+            self.positional_embedding = None
+            use_rope = True
         else:
             raise ValueError(f"unknown positional encoding: {pos_encoding}")
 
-        self.transformer = Transformer(d_model, n_heads, n_layers, n_kv_heads, mode)
-        self.ln_f = nn.LayerNorm(d_model)
+        self.transformer = Transformer(d_model, n_heads, n_layers, n_kv_heads, mode, use_rope)
+        #self.ln_f = nn.LayerNorm(d_model)
+        self.ln_f = RMSNorm(d_model)
 
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
@@ -38,10 +45,13 @@ class GPT(nn.Module):
 
         tok_emb = self.token_embedding(idx) # (B, T, d_model)
 
-        pos = torch.arange(T, device=idx.device)
-        pos_emb = self.positional_embedding(pos)  # (T, d_model)
+        if (self.positional_embedding is not None):
+            pos = torch.arange(T, device=idx.device)
+            pos_emb = self.positional_embedding(pos)  # (T, d_model)
 
-        x = tok_emb + pos_emb   # (B, T, d_model)
+            x = tok_emb + pos_emb   # (B, T, d_model)
+        else:
+            x = tok_emb
 
         mask = torch.tril(torch.ones(T, T, device=idx.device))
         mask = mask.view(1, 1, T, T)
@@ -53,21 +63,33 @@ class GPT(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=None):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
 
             logits = self(idx_cond)    # (B, T, vocab_size)
             logits = logits[:, -1, :]  # (B, vocab_size)
 
-            #topk sampling
-            top_k = 50
-            values, _ = torch.topk(logits, top_k)
-            min_value = values[:, -1].unsqueeze(-1)
-            logits = torch.where(logits < min_value, torch.full_like(logits, -float("inf")), logits)
+            if top_k is not None:
+                top_k = min(top_k, logits.shape[-1])
+                values, _ = torch.topk(logits, top_k)
+                min_value = values[:, -1].unsqueeze(-1)
+                logits = torch.where(logits < min_value, torch.full_like(logits, -float("inf")), logits)
 
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
+
+            if top_p is not None:
+                sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                remove = cumulative_probs > top_p
+                remove[..., 1:] = remove[..., :-1].clone()
+                remove[..., 0] = False
+
+                sorted_probs = sorted_probs.masked_fill(remove, 0.0)
+                probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
 
             next_idx = torch.multinomial(probs, num_samples=1)  # (B, 1)
 

@@ -6,3 +6,4 @@ checkpoints/
 *.pth
 
 mixed_train.txt
+medium_train.txt
