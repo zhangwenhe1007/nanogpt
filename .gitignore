@@ -7,4 +7,5 @@ checkpoints/
 
 mixed_train.txt
 medium_train.txt
+instruction_train.txt
 *.tokens.pt

@@ -68,6 +68,7 @@ while True:
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        eos_token_id=enc.eot_token,
     )
 
     text = enc.decode(out[0].tolist())

@@ -27,6 +27,7 @@ parser.add_argument("--base-lr", type=float, default=3e-4)
 parser.add_argument("--min-lr", type=float, default=3e-5)
 parser.add_argument("--warmup-steps", type=int, default=100)
 parser.add_argument("--max-steps", type=int, default=10000)
+parser.add_argument("--resume-from", type=str, default=None)
 args = parser.parse_args()
 
 block_size = args.block_size
@@ -42,6 +43,7 @@ base_lr = args.base_lr
 min_lr = args.min_lr
 warmup_steps = args.warmup_steps
 max_steps = args.max_steps
+resume_from = args.resume_from
 
 checkpoint_root = "checkpoints"
 if attention_mode == "gqa":
@@ -95,6 +97,18 @@ model = model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr)
 scheduler = WarmupCosineScheduler(optimizer, base_lr, min_lr, warmup_steps, max_steps)
+start_step = 0
+
+if resume_from is not None:
+    checkpoint = torch.load(resume_from, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state_dict)
+
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    start_step = checkpoint.get("step", -1) + 1
+    print(f"resuming from {resume_from} at step {start_step}")
 
 def save_checkpoint(path, step):
     torch.save({
@@ -130,19 +144,17 @@ def estimate_loss(model, loader, device, max_batches=50):
     model.train()
     return sum(losses) / len(losses)
 
-pbar = tqdm(train_loader)
+pbar = tqdm(train_loader, initial=start_step, total=max_steps)
 
-step = 0
+step = start_step - 1
 
-for step, (x, y) in enumerate(pbar):
+for local_step, (x, y) in enumerate(pbar):
+    step = start_step + local_step
+
     if step >= max_steps:
         break
 
     lr = scheduler.step(step)
-
-    if step > 0 and step % 10000 == 0:
-        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
-        save_checkpoint(checkpoint_path, step)
     
     if step > 0 and step % 3000 == 0:
         model.eval()
@@ -150,14 +162,15 @@ for step, (x, y) in enumerate(pbar):
         sample_prompts = [
             "Once upon a time",
             "In simple terms, machine learning is",
-            "Question: What is the capital of France?\nAnswer:",
+            "The history of the Roman Empire",
+            "Photosynthesis is the process by which",
         ]
 
         for prompt in sample_prompts:
             ids = enc.encode(prompt)
             idx = torch.tensor([ids], dtype=torch.long, device=device)
 
-            out = model.generate(idx, max_new_tokens=30)
+            out = model.generate(idx, max_new_tokens=30, eos_token_id=enc.eot_token)
             print("\n--- sample ---")
             print(enc.decode(out[0].tolist()))
 
@@ -185,6 +198,10 @@ for step, (x, y) in enumerate(pbar):
     optimizer.step()
 
     pbar.set_description(f"loss {loss.item():.4f}")
+
+    if step > 0 and step % 10000 == 0:
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
+        save_checkpoint(checkpoint_path, step)
 
 #save last checkpoint
 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")

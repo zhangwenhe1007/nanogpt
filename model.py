@@ -63,7 +63,7 @@ class GPT(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=None, eos_token_id=None):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
 
@@ -94,6 +94,9 @@ class GPT(nn.Module):
             next_idx = torch.multinomial(probs, num_samples=1)  # (B, 1)
 
             idx = torch.cat([idx, next_idx], dim=1)    # (B, T+1)
+
+            if eos_token_id is not None and torch.all(next_idx == eos_token_id):
+                break
         return idx
 
 class SinusoidalPositionalEncoding(nn.Module):
