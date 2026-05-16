@@ -11,6 +11,8 @@ parser.add_argument("--max-new-tokens", type=int, default=100)
 parser.add_argument("--temperature", type=float, default=0.8)
 parser.add_argument("--top-k", type=int, default=50)
 parser.add_argument("--top-p", type=float, default=None)
+parser.add_argument("--multiline", action="store_true")
+parser.add_argument("--end-marker", type=str, default="END")
 
 args = parser.parse_args()
 
@@ -53,8 +55,23 @@ model.load_state_dict(state)
 model = model.to(device)
 model.eval()
 
+
+def read_prompt(multiline, end_marker):
+    if not multiline:
+        return input("\nPrompt> ")
+
+    print(f"\nPrompt> paste your prompt. End with a line containing only {end_marker}.")
+    lines = []
+    while True:
+        line = input()
+        if line == end_marker:
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 while True:
-    prompt = input("\nPrompt> ")
+    prompt = read_prompt(args.multiline, args.end_marker)
 
     if prompt.lower() in {"exit", "quit", "q"}:
         break
