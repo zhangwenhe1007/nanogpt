@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import random
+import sys
 
 from datasets import load_dataset
 
@@ -378,6 +380,12 @@ def main():
     print(f"buckets: {buckets}")
     print(f"sources: {counts}")
     print(f"resets: {resets}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Some HF streaming/PyArrow builds can crash during interpreter shutdown
+    # after all data has already been written. This avoids that cleanup path.
+    os._exit(0)
 
 
 if __name__ == "__main__":
