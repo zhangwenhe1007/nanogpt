@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 
 import torch
@@ -30,19 +31,17 @@ def find_response_start(text):
 
 
 class InstructionDataset(Dataset):
-    def __init__(self, path, block_size, enc, split="train", train_frac=0.9):
+    def __init__(self, path, block_size, enc, split="train", train_frac=0.9, data_format="auto"):
         self.block_size = block_size
         self.enc = enc
+        self.data_format = infer_data_format(path, data_format)
 
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        raw_examples = text.split("<|endoftext|>")
-        examples = []
-        for ex in raw_examples:
-            ex = ex.strip()
-            if ex:
-                examples.append(ex + "<|endoftext|>")
+        if self.data_format == "jsonl":
+            examples = read_jsonl_examples(path)
+        elif self.data_format == "text":
+            examples = read_text_examples(path)
+        else:
+            raise ValueError("data_format must be 'auto', 'text', or 'jsonl'")
 
         n = int(train_frac * len(examples))
 
@@ -57,10 +56,17 @@ class InstructionDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        text = self.examples[idx]
-        response_start = find_response_start(text)
+        example = self.examples[idx]
 
-        prompt_text = text[:response_start]
+        if isinstance(example, dict):
+            prompt_text = example["prompt"]
+            response_text = example["response"] + "<|endoftext|>"
+            text = prompt_text + response_text
+        else:
+            text = example
+            response_start = find_response_start(text)
+            prompt_text = text[:response_start]
+
         ids = self.enc.encode(text, allowed_special={"<|endoftext|>"})
         prompt_ids = self.enc.encode(prompt_text, allowed_special={"<|endoftext|>"})
 
@@ -87,6 +93,52 @@ class InstructionDataset(Dataset):
             torch.tensor(y, dtype=torch.long),
             torch.tensor(loss_mask, dtype=torch.float),
         )
+
+
+def infer_data_format(path, data_format):
+    if data_format != "auto":
+        return data_format
+    if path.endswith(".jsonl"):
+        return "jsonl"
+    return "text"
+
+
+def read_text_examples(path):
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    raw_examples = text.split("<|endoftext|>")
+    examples = []
+    for ex in raw_examples:
+        ex = ex.strip()
+        if ex:
+            examples.append(ex + "<|endoftext|>")
+    return examples
+
+
+def read_jsonl_examples(path):
+    examples = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            record = json.loads(line)
+            prompt = record.get("prompt")
+            response = record.get("response")
+
+            if prompt is None or response is None:
+                text = record.get("text")
+                if text:
+                    examples.append(text)
+                continue
+
+            if response.endswith("<|endoftext|>"):
+                response = response[: -len("<|endoftext|>")]
+
+            examples.append({"prompt": prompt, "response": response})
+    return examples
 
 
 def masked_cross_entropy(logits, targets, loss_mask):
@@ -150,6 +202,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, default="instruction_train.txt")
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--data-format", type=str, default="auto", choices=["auto", "text", "jsonl"])
     parser.add_argument("--output-dir", type=str, default="checkpoints/finetune")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--base-lr", type=float, default=5e-5)
@@ -199,8 +252,20 @@ def main():
 
     model = model.to(device)
 
-    train_dataset = InstructionDataset(args.data_path, model_config["block_size"], enc, split="train")
-    val_dataset = InstructionDataset(args.data_path, model_config["block_size"], enc, split="val")
+    train_dataset = InstructionDataset(
+        args.data_path,
+        model_config["block_size"],
+        enc,
+        split="train",
+        data_format=args.data_format,
+    )
+    val_dataset = InstructionDataset(
+        args.data_path,
+        model_config["block_size"],
+        enc,
+        split="val",
+        data_format=args.data_format,
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
