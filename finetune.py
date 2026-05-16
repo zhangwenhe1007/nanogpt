@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import os
 
@@ -141,6 +142,20 @@ def read_jsonl_examples(path):
     return examples
 
 
+def show_debug_batch(dataset, enc, count=2):
+    for i in range(min(count, len(dataset))):
+        x, y, loss_mask = dataset[i]
+        active = loss_mask.bool()
+        prompt = enc.decode(x[~active].tolist())
+        target = enc.decode(y[active].tolist())
+        print(f"\n--- debug example {i} ---")
+        print("prompt/context tokens:")
+        print(prompt)
+        print("supervised target tokens:")
+        print(target)
+        print(f"active loss tokens: {int(loss_mask.sum().item())}")
+
+
 def masked_cross_entropy(logits, targets, loss_mask):
     B, T, C = logits.shape
     loss = F.cross_entropy(
@@ -212,6 +227,7 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--debug-batch", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -270,6 +286,9 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
+    if args.debug_batch:
+        show_debug_batch(train_dataset, enc)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr)
     scheduler = WarmupCosineScheduler(
         optimizer,
@@ -294,10 +313,10 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
         }, path)
 
-    pbar = tqdm(train_loader, initial=start_step, total=args.max_steps)
+    pbar = tqdm(total=args.max_steps, initial=start_step)
     step = start_step - 1
 
-    for local_step, (x, y, loss_mask) in enumerate(pbar):
+    for local_step, (x, y, loss_mask) in enumerate(itertools.cycle(train_loader)):
         step = start_step + local_step
 
         if step >= args.max_steps:
@@ -311,7 +330,7 @@ def main():
 
             model.eval()
             prompts = [
-                "Question: What is the capital of France?\nAnswer:",
+                "Question: What is the capital of France?\nAnswer:\n",
                 "### Instruction:\nExplain machine learning in one sentence.\n\n### Response:\n",
             ]
             for prompt in prompts:
@@ -336,6 +355,7 @@ def main():
         optimizer.step()
 
         pbar.set_description(f"loss {loss.item():.4f} lr {lr:.2e}")
+        pbar.update(1)
 
         if step > 0 and step % args.save_interval == 0:
             checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
@@ -343,6 +363,7 @@ def main():
 
     checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
     save_checkpoint(checkpoint_path, step)
+    pbar.close()
 
 
 if __name__ == "__main__":
