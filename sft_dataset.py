@@ -2,16 +2,22 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 
 from datasets import load_dataset
 
 
 END = "<|endoftext|>"
+WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 def clean(text):
     return " ".join(str(text or "").split())
+
+
+def words(text):
+    return [w.lower() for w in WORD_RE.findall(text)]
 
 
 def load_stream(dataset_name, *, config=None, split="train"):
@@ -56,6 +62,41 @@ def trim(text, max_chars):
     return text[:max_chars].rsplit(" ", 1)[0]
 
 
+def too_echoey(instruction, response):
+    instruction_words = set(words(instruction))
+    response_words = words(response)
+
+    if len(instruction_words) < 8 or len(response_words) < 8:
+        return False
+
+    response_prefix = set(response_words[:80])
+    overlap = len(instruction_words & response_prefix) / max(1, len(response_prefix))
+    return overlap > 0.75
+
+
+def bad_pristine_example(instruction, response):
+    if not instruction or not response:
+        return True
+
+    response_lower = response.lower()
+    banned = [
+        "### instruction",
+        "### response",
+        "### input",
+        "<|endoftext|>",
+    ]
+    if any(marker in response_lower for marker in banned):
+        return True
+
+    if len(response) < 30:
+        return True
+
+    if too_echoey(instruction, response):
+        return True
+
+    return False
+
+
 def make_qa(question, answer, source, *, context=None, max_prompt_chars=3000, max_response_chars=2000):
     question = clean(question)
     answer = trim(answer, max_response_chars)
@@ -94,6 +135,39 @@ def make_instruction(instruction, response, source, *, input_text=None, max_prom
         prompt = "### Instruction:\n" + instruction + "\n\n### Response:\n"
 
     return {"type": "instruction", "source": source, "prompt": prompt, "response": response}
+
+
+def make_pristine_instruction(
+    instruction,
+    response,
+    source,
+    *,
+    input_text=None,
+    max_prompt_chars=1600,
+    max_response_chars=1000,
+):
+    instruction = trim(instruction, max_prompt_chars)
+    response = trim(response, max_response_chars)
+    input_text = trim(input_text, max_prompt_chars) if input_text else ""
+
+    if bad_pristine_example(instruction + " " + input_text, response):
+        return None
+
+    if input_text:
+        prompt = (
+            "### Instruction:\n" + instruction + "\n\n"
+            "### Input:\n" + input_text + "\n\n"
+            "### Response:\n"
+        )
+    else:
+        prompt = "### Instruction:\n" + instruction + "\n\n### Response:\n"
+
+    return {
+        "type": "pristine_instruction",
+        "source": source,
+        "prompt": prompt,
+        "response": response,
+    }
 
 
 def make_chat(messages, source, *, max_prompt_chars=3000, max_response_chars=2000):
@@ -199,8 +273,31 @@ def format_gsm8k(ex):
     return make_qa(ex.get("question", ""), ex.get("answer", ""), "gsm8k")
 
 
+def format_gsm8k_pristine(ex):
+    answer = clean(ex.get("answer", ""))
+    if "####" in answer:
+        final_answer = answer.rsplit("####", 1)[1].strip()
+        answer = "The answer is " + final_answer + "."
+
+    return make_pristine_instruction(
+        "Solve the problem and give the final answer.",
+        answer,
+        "gsm8k",
+        input_text=ex.get("question", ""),
+    )
+
+
 def format_dolly(ex):
     return make_instruction(
+        ex.get("instruction", ""),
+        ex.get("response", ""),
+        "dolly",
+        input_text=ex.get("context", ""),
+    )
+
+
+def format_dolly_pristine(ex):
+    return make_pristine_instruction(
         ex.get("instruction", ""),
         ex.get("response", ""),
         "dolly",
@@ -217,6 +314,15 @@ def format_alpaca(ex):
     )
 
 
+def format_alpaca_pristine(ex):
+    return make_pristine_instruction(
+        ex.get("instruction", ""),
+        ex.get("output", ""),
+        "alpaca",
+        input_text=ex.get("input", ""),
+    )
+
+
 def format_openorca(ex):
     system_prompt = ex.get("system_prompt", "")
     question = ex.get("question", "")
@@ -225,6 +331,25 @@ def format_openorca(ex):
     else:
         instruction = question
     return make_instruction(instruction, ex.get("response", ""), "openorca")
+
+
+def format_openorca_pristine(ex):
+    system_prompt = clean(ex.get("system_prompt", ""))
+    question = clean(ex.get("question", ""))
+
+    if system_prompt:
+        instruction = system_prompt
+        input_text = question
+    else:
+        instruction = question
+        input_text = ""
+
+    return make_pristine_instruction(
+        instruction,
+        ex.get("response", ""),
+        "openorca",
+        input_text=input_text,
+    )
 
 
 def format_ultrachat(ex):
@@ -276,6 +401,13 @@ def source_specs(mode):
         ("arc_challenge_math", "math", 0.15, "allenai/ai2_arc", format_arc, "ARC-Challenge", "train"),
     ]
 
+    pristine = [
+        ("alpaca", "pristine_instruction", 0.40, "tatsu-lab/alpaca", format_alpaca_pristine, None, "train"),
+        ("openorca", "pristine_instruction", 0.35, "Open-Orca/OpenOrca", format_openorca_pristine, None, "train"),
+        ("dolly", "pristine_instruction", 0.20, "databricks/databricks-dolly-15k", format_dolly_pristine, None, "train"),
+        ("gsm8k", "pristine_instruction", 0.05, "openai/gsm8k", format_gsm8k_pristine, "main", "train"),
+    ]
+
     if mode == "qa":
         return qa
     if mode == "instruction":
@@ -284,6 +416,8 @@ def source_specs(mode):
         return chat
     if mode == "mixed":
         return scale_bucket(qa, 0.40) + scale_bucket(instruction, 0.30) + scale_bucket(chat, 0.20) + scale_bucket(math, 0.10)
+    if mode == "pristine":
+        return pristine
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -334,7 +468,7 @@ def next_record(source):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="mixed", choices=["qa", "instruction", "chat", "mixed"])
+    parser.add_argument("--mode", type=str, default="mixed", choices=["qa", "instruction", "chat", "mixed", "pristine"])
     parser.add_argument("--output", type=str, default="sft_mixed_1m.txt")
     parser.add_argument("--num-examples", type=int, default=1_000_000)
     parser.add_argument("--format", type=str, default="text", choices=["text", "jsonl"])
@@ -350,6 +484,7 @@ def main():
     counts = {name: 0 for name in names}
     buckets = {source["bucket"]: 0 for source in sources}
     resets = {name: 0 for name in names}
+    response_lengths = []
 
     renderer = render_text if args.format == "text" else render_jsonl
 
@@ -369,6 +504,7 @@ def main():
             counts[name] += 1
             buckets[source["bucket"]] += 1
             resets[name] = source["resets"]
+            response_lengths.append(len(record["response"]))
 
             if (i + 1) % 10_000 == 0:
                 print(f"wrote {i + 1} examples")
@@ -380,6 +516,12 @@ def main():
     print(f"buckets: {buckets}")
     print(f"sources: {counts}")
     print(f"resets: {resets}")
+    if response_lengths:
+        response_lengths.sort()
+        p50 = response_lengths[len(response_lengths) // 2]
+        p95 = response_lengths[int(len(response_lengths) * 0.95)]
+        p99 = response_lengths[int(len(response_lengths) * 0.99)]
+        print(f"response chars: p50={p50} p95={p95} p99={p99} max={response_lengths[-1]}")
     sys.stdout.flush()
     sys.stderr.flush()
 
