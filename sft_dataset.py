@@ -97,6 +97,26 @@ def bad_pristine_example(instruction, response):
     return False
 
 
+def bad_pristine_math_example(instruction, response):
+    if not instruction or not response:
+        return True
+
+    response_lower = response.lower()
+    banned = [
+        "### instruction",
+        "### response",
+        "### input",
+        "<|endoftext|>",
+    ]
+    if any(marker in response_lower for marker in banned):
+        return True
+
+    if too_echoey(instruction, response):
+        return True
+
+    return False
+
+
 def make_qa(question, answer, source, *, context=None, max_prompt_chars=3000, max_response_chars=2000):
     question = clean(question)
     answer = trim(answer, max_response_chars)
@@ -279,12 +299,24 @@ def format_gsm8k_pristine(ex):
         final_answer = answer.rsplit("####", 1)[1].strip()
         answer = "The answer is " + final_answer + "."
 
-    return make_pristine_instruction(
-        "Solve the problem and give the final answer.",
-        answer,
-        "gsm8k",
-        input_text=ex.get("question", ""),
+    instruction = "Solve the problem and give the final answer."
+    input_text = trim(ex.get("question", ""), 1600)
+    answer = trim(answer, 1000)
+
+    if bad_pristine_math_example(instruction + " " + input_text, answer):
+        return None
+
+    prompt = (
+        "### Instruction:\n" + instruction + "\n\n"
+        "### Input:\n" + input_text + "\n\n"
+        "### Response:\n"
     )
+    return {
+        "type": "pristine_instruction",
+        "source": "gsm8k",
+        "prompt": prompt,
+        "response": answer,
+    }
 
 
 def format_dolly(ex):
@@ -409,9 +441,8 @@ def source_specs(mode):
     ]
 
     pristine_small = [
-        ("alpaca", "pristine_instruction", 0.60, "tatsu-lab/alpaca", format_alpaca_pristine, None, "train"),
+        ("alpaca", "pristine_instruction", 0.70, "tatsu-lab/alpaca", format_alpaca_pristine, None, "train"),
         ("dolly", "pristine_instruction", 0.30, "databricks/databricks-dolly-15k", format_dolly_pristine, None, "train"),
-        ("gsm8k", "pristine_instruction", 0.10, "openai/gsm8k", format_gsm8k_pristine, "main", "train"),
     ]
 
     if mode == "qa":
@@ -461,8 +492,15 @@ def build_sources(mode):
     return sources
 
 
-def next_record(source):
+def next_record(source, max_attempts=1000):
+    attempts = 0
     while True:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                f"source {source['name']} produced no usable records after {max_attempts} attempts"
+            )
+
         try:
             ex = next(source["iterator"])
         except StopIteration:
