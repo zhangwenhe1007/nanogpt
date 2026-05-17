@@ -1,11 +1,13 @@
 import argparse
-import itertools
 import json
 import os
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 import tiktoken
 from tqdm import tqdm
 
@@ -13,7 +15,33 @@ from model import GPT
 from schedulers import WarmupCosineScheduler
 
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+def setup_distributed():
+    ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    return ddp, rank, local_rank, world_size, device
+
+
+def infinite_loader(loader, sampler=None, start_epoch=0):
+    epoch = start_epoch
+    while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        for batch in loader:
+            yield batch
+        epoch += 1
 
 
 def find_response_start(text):
@@ -189,7 +217,7 @@ def estimate_loss(model, loader, device, max_batches=50):
     return sum(losses) / len(losses)
 
 
-def load_pretrained_model(checkpoint_path, fallback_config):
+def load_pretrained_model(checkpoint_path, fallback_config, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -230,7 +258,14 @@ def main():
     parser.add_argument("--debug-batch", action="store_true")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    ddp, rank, local_rank, world_size, device = setup_distributed()
+    is_main_process = rank == 0
+    autocast_device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+
+    if is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+    if ddp:
+        dist.barrier()
 
     enc = tiktoken.get_encoding("gpt2")
     fallback_config = {
@@ -245,6 +280,7 @@ def main():
     }
 
     start_step = 0
+    resume_checkpoint = None
     if args.resume_from:
         resume_checkpoint = torch.load(args.resume_from, map_location=device)
         model_config = resume_checkpoint["model_config"]
@@ -260,11 +296,12 @@ def main():
         )
         model.load_state_dict(resume_checkpoint["model_state_dict"])
         start_step = resume_checkpoint.get("step", -1) + 1
-        print(f"resuming finetune from {args.resume_from} at step {start_step}")
+        if is_main_process:
+            print(f"resuming finetune from {args.resume_from} at step {start_step}")
     else:
         if args.checkpoint is None:
             raise ValueError("--checkpoint is required unless --resume-from is set")
-        model, model_config = load_pretrained_model(args.checkpoint, fallback_config)
+        model, model_config = load_pretrained_model(args.checkpoint, fallback_config, device)
 
     model = model.to(device)
 
@@ -283,11 +320,25 @@ def main():
         data_format=args.data_format,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        if ddp else None
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+    )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    if args.debug_batch:
+    if args.debug_batch and is_main_process:
         show_debug_batch(train_dataset, enc)
+    if ddp:
+        dist.barrier()
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr)
     scheduler = WarmupCosineScheduler(
@@ -302,68 +353,103 @@ def main():
         if "optimizer_state_dict" in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
 
-    train_config = vars(args)
+    train_config = dict(vars(args))
+    train_config["world_size"] = world_size
+    train_config["global_batch_size"] = args.batch_size * world_size
+
+    def raw_model():
+        return model.module if ddp else model
 
     def save_checkpoint(path, step):
         torch.save({
             "step": step,
             "model_config": model_config,
             "train_config": train_config,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": raw_model().state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         }, path)
 
-    pbar = tqdm(total=args.max_steps, initial=start_step)
+    pbar = tqdm(total=args.max_steps, initial=start_step) if is_main_process else None
     step = start_step - 1
+    start_epoch = start_step // max(1, len(train_loader))
 
-    for local_step, (x, y, loss_mask) in enumerate(itertools.cycle(train_loader)):
-        step = start_step + local_step
+    try:
+        for local_step, (x, y, loss_mask) in enumerate(infinite_loader(train_loader, train_sampler, start_epoch)):
+            step = start_step + local_step
 
-        if step >= args.max_steps:
-            break
+            if step >= args.max_steps:
+                break
 
-        lr = scheduler.step(step)
+            lr = scheduler.step(step)
 
-        if step > 0 and step % args.eval_interval == 0:
-            val_loss = estimate_loss(model, val_loader, device)
-            print(f"\nstep {step}: val loss {val_loss:.4f}")
+            if step > 0 and step % args.eval_interval == 0:
+                if ddp:
+                    dist.barrier()
 
-            model.eval()
-            prompts = [
-                "Question: What is the capital of France?\nAnswer:\n",
-                "### Instruction:\nExplain machine learning in one sentence.\n\n### Response:\n",
-            ]
-            for prompt in prompts:
-                ids = enc.encode(prompt)
-                idx = torch.tensor([ids], dtype=torch.long, device=device)
-                out = model.generate(idx, max_new_tokens=60, temperature=0.7, top_k=50, eos_token_id=enc.eot_token)
-                print("\n--- sample ---")
-                print(enc.decode(out[0].tolist()))
-            model.train()
+                if is_main_process:
+                    val_loss = estimate_loss(raw_model(), val_loader, device)
+                    print(f"\nstep {step}: val loss {val_loss:.4f}")
 
-        x = x.to(device)
-        y = y.to(device)
-        loss_mask = loss_mask.to(device)
+                    raw_model().eval()
+                    prompts = [
+                        "### Instruction:\nExplain machine learning in one sentence.\n\n### Response:\n",
+                        (
+                            "### Instruction:\nAnswer the question in one short sentence.\n\n"
+                            "### Input:\nWhat is the capital of France?\n\n"
+                            "### Response:\n"
+                        ),
+                    ]
+                    for prompt in prompts:
+                        ids = enc.encode(prompt)
+                        idx = torch.tensor([ids], dtype=torch.long, device=device)
+                        out = raw_model().generate(
+                            idx,
+                            max_new_tokens=60,
+                            temperature=0.7,
+                            top_k=50,
+                            eos_token_id=enc.eot_token,
+                        )
+                        print("\n--- sample ---")
+                        print(enc.decode(out[0].tolist()))
+                    raw_model().train()
 
-        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")):
-            logits = model(x)
-            loss = masked_cross_entropy(logits, y, loss_mask)
+                if ddp:
+                    dist.barrier()
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            x = x.to(device)
+            y = y.to(device)
+            loss_mask = loss_mask.to(device)
 
-        pbar.set_description(f"loss {loss.item():.4f} lr {lr:.2e}")
-        pbar.update(1)
+            with torch.autocast(
+                device_type=autocast_device_type,
+                dtype=torch.bfloat16,
+                enabled=autocast_device_type == "cuda",
+            ):
+                logits = model(x)
+                loss = masked_cross_entropy(logits, y, loss_mask)
 
-        if step > 0 and step % args.save_interval == 0:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            if is_main_process:
+                pbar.set_description(f"loss {loss.item():.4f} lr {lr:.2e}")
+                pbar.update(1)
+
+            if is_main_process and step > 0 and step % args.save_interval == 0:
+                checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
+                save_checkpoint(checkpoint_path, step)
+
+        if is_main_process:
             checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
             save_checkpoint(checkpoint_path, step)
 
-    checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
-    save_checkpoint(checkpoint_path, step)
-    pbar.close()
+    finally:
+        if is_main_process and pbar is not None:
+            pbar.close()
+        if ddp:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
