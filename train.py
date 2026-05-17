@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--relative-lr", action="store_true")
     return parser.parse_args()
 
 
@@ -129,6 +130,7 @@ def main():
         "min_lr": args.min_lr,
         "warmup_steps": args.warmup_steps,
         "max_steps": args.max_steps,
+        "relative_lr": args.relative_lr,
         "world_size": world_size,
     }
 
@@ -172,12 +174,18 @@ def main():
         model = DDP(model, device_ids=[local_rank])
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr)
+    scheduler_max_steps = args.max_steps
+    if args.relative_lr:
+        scheduler_max_steps = args.max_steps - start_step
+        if scheduler_max_steps <= 0:
+            raise ValueError("--max-steps must be greater than the checkpoint step when using --relative-lr")
+
     scheduler = WarmupCosineScheduler(
         optimizer,
         args.base_lr,
         args.min_lr,
         args.warmup_steps,
-        args.max_steps,
+        scheduler_max_steps,
     )
 
     if checkpoint is not None and "optimizer_state_dict" in checkpoint:
@@ -206,7 +214,8 @@ def main():
             if step >= args.max_steps:
                 break
 
-            lr = scheduler.step(step)
+            scheduler_step = local_step if args.relative_lr else step
+            lr = scheduler.step(scheduler_step)
 
             if step > 0 and step % 3000 == 0:
                 if ddp:
