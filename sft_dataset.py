@@ -408,6 +408,12 @@ def source_specs(mode):
         ("gsm8k", "pristine_instruction", 0.05, "openai/gsm8k", format_gsm8k_pristine, "main", "train"),
     ]
 
+    pristine_small = [
+        ("alpaca", "pristine_instruction", 0.60, "tatsu-lab/alpaca", format_alpaca_pristine, None, "train"),
+        ("dolly", "pristine_instruction", 0.30, "databricks/databricks-dolly-15k", format_dolly_pristine, None, "train"),
+        ("gsm8k", "pristine_instruction", 0.10, "openai/gsm8k", format_gsm8k_pristine, "main", "train"),
+    ]
+
     if mode == "qa":
         return qa
     if mode == "instruction":
@@ -418,6 +424,8 @@ def source_specs(mode):
         return scale_bucket(qa, 0.40) + scale_bucket(instruction, 0.30) + scale_bucket(chat, 0.20) + scale_bucket(math, 0.10)
     if mode == "pristine":
         return pristine
+    if mode == "pristine_small":
+        return pristine_small
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -468,10 +476,16 @@ def next_record(source):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="mixed", choices=["qa", "instruction", "chat", "mixed", "pristine"])
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="mixed",
+        choices=["qa", "instruction", "chat", "mixed", "pristine", "pristine_small"],
+    )
     parser.add_argument("--output", type=str, default="sft_mixed_1m.txt")
     parser.add_argument("--num-examples", type=int, default=1_000_000)
     parser.add_argument("--format", type=str, default="text", choices=["text", "jsonl"])
+    parser.add_argument("--progress-interval", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
@@ -506,11 +520,12 @@ def main():
             resets[name] = source["resets"]
             response_lengths.append(len(record["response"]))
 
-            if (i + 1) % 10_000 == 0:
+            if args.progress_interval > 0 and (i + 1) % args.progress_interval == 0:
                 print(f"wrote {i + 1} examples")
                 print(f"  buckets: {buckets}")
                 print(f"  sources: {counts}")
                 print(f"  resets: {resets}")
+                sys.stdout.flush()
 
     print(f"done: wrote {args.num_examples} examples to {args.output}")
     print(f"buckets: {buckets}")
